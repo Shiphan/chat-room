@@ -1,0 +1,3 @@
+RewriteEngine On
+RewriteBase /
+RewriteRule ^room\/([a-z]{5})$ room.php?key=$1 [L]

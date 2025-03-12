@@ -1,0 +1,18 @@
+services:
+  nginx:
+    build: ./nginx
+    ports:
+      - "8088:80"
+    depends_on:
+      - php
+      - rust
+  php:
+    build: ./php
+    expose:
+      - "80"
+  rust:
+    build: ./rust
+    init: true
+    expose:
+      - "80"
+

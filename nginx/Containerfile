@@ -1,0 +1,7 @@
+FROM nginx:1.27.4
+
+WORKDIR /etc/nginx
+
+COPY nginx.conf nginx.conf
+
+EXPOSE 80

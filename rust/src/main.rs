@@ -5,9 +5,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing;
 use axum::Router;
 use futures::{SinkExt, StreamExt};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fmt::Display;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -16,7 +15,6 @@ use tokio::sync::Mutex;
 #[tokio::main]
 async fn main() {
     let listener = TcpListener::bind("0.0.0.0:80").await.unwrap();
-    // let listener = TcpListener::bind("localhost:8080").await?;
     println!("[INFO] server listening: {:?}", listener);
 
     let state = Arc::new(State::new());
@@ -24,8 +22,12 @@ async fn main() {
     let _ = tokio::spawn({
         let server = state.clone();
         async move {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            server.clear().await;
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                println!("[INFO] start clear");
+                server.clear().await;
+                println!("[INFO] end clear");
+            }
         }
     });
 
@@ -88,12 +90,27 @@ async fn room_handler(
 
     ws.on_upgrade(move |socket| room_socket_handler(room, id, user, socket))
 }
-async fn room_socket_handler(room: Arc<Room>, user_id: u32, user: Arc<User>, socket: WebSocket) {
+async fn room_socket_handler(
+    room: Arc<Room>,
+    user_id: u32,
+    user: Arc<Mutex<User>>,
+    socket: WebSocket,
+) {
+    user.lock().await.connection_state = ConnectionState::Connected;
     let (mut sender, mut receiver) = socket.split();
 
-    let _ = sender
-        .send(extract::ws::Message::Text("HI from server".into()))
-        .await;
+    if let Some(name) = &user.lock().await.name {
+        let _ = sender
+            .send(extract::ws::Message::Text(
+                serde_json::to_string(&SocketUpdateMessage::YourName(name.clone()))
+                    .unwrap()
+                    .into(),
+            ))
+            .await;
+    }
+    //let _ = sender
+    //    .send(ws::Message::Text("HI from server".into()))
+    //    .await;
 
     let _ = tokio::join!(
         {
@@ -106,7 +123,11 @@ async fn room_socket_handler(room: Arc<Room>, user_id: u32, user: Arc<User>, soc
                     if messages.len() > len {
                         if sender
                             .send(extract::ws::Message::Text(
-                                messages.get(len).unwrap().into(),
+                                serde_json::to_string(&SocketUpdateMessage::NewMessage(
+                                    messages.get(len).unwrap().clone(),
+                                ))
+                                .unwrap()
+                                .into(),
                             ))
                             .await
                             .is_err()
@@ -118,20 +139,53 @@ async fn room_socket_handler(room: Arc<Room>, user_id: u32, user: Arc<User>, soc
                 }
             }
         },
-        async move {
-            while let Some(Ok(message)) = receiver.next().await {
-                match message {
-                    ws::Message::Text(message) => {
-                        room.messages.lock().await.push(match &user.name {
-                            Some(name) => format!("{message} by {name} <{user_id}>"),
-                            None => format!("{message} by <{user_id}>"),
-                        })
+        {
+            let user = user.clone();
+            async move {
+                while let Some(Ok(message)) = receiver.next().await {
+                    match message {
+                        ws::Message::Text(message) => {
+                            // TODO: remove unwrap
+                            match serde_json::from_str::<SocketMessage>(&message).unwrap() {
+                                SocketMessage::NewMessage(message) => {
+                                    room.messages.lock().await.push(Message {
+                                        content: message,
+                                        user_id,
+                                        user_name: user.lock().await.name.clone(),
+                                    })
+                                }
+                                SocketMessage::UpdateName(name) => {
+                                    user.lock().await.name = Some(name)
+                                }
+                            }
+                        }
+                        _ => println!("[INFO] got a message from websocket: {:?}", message),
                     }
-                    _ => println!("[INFO] got a message from websocket: {:?}", message),
                 }
             }
         }
     );
+
+    user.lock().await.connection_state = ConnectionState::LastTime(Instant::now());
+    println!("[INFO] a socket end and close, {:?}", user);
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "type", content = "value")]
+enum SocketMessage {
+    #[serde(rename = "new_message")]
+    NewMessage(String),
+    #[serde(rename = "update_name")]
+    UpdateName(String),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "type", content = "value")]
+enum SocketUpdateMessage {
+    #[serde(rename = "new_message")]
+    NewMessage(Message),
+    #[serde(rename = "your_name")]
+    YourName(String),
 }
 
 #[derive(Debug)]
@@ -146,14 +200,20 @@ impl State {
         }
     }
     async fn clear(&self) {
+        println!("[TICK] tick a");
         let now = Instant::now();
         self.rooms.lock().await.retain(|_, room| {
-            let mut users = room.users.blocking_lock();
-            users.retain(|_, user| {
-                !matches!(user.connection_state, ConnectionState::LastTime(instant) if now.duration_since(instant) > Duration::from_secs(30))
-            });
-            users.is_empty()
+            println!("[TICK] tick b");
+            let mut users = tokio::task::block_in_place(|| room.users.blocking_lock());
+            println!("[TICK] tick b.2");
+            users.retain(|_, user| !matches!(
+                tokio::task::block_in_place(|| user.blocking_lock()).connection_state,
+                ConnectionState::LastTime(instant) if now.duration_since(instant) > Duration::from_secs(30)
+            ));
+            println!("[TICK] tick c");
+            !users.is_empty()
         });
+        println!("[INFO] a clear, rooms after clear: {:?}", self.rooms);
     }
     async fn get_room(&self, key: &str) -> Arc<Room> {
         let mut rooms = self.rooms.lock().await;
@@ -170,8 +230,8 @@ impl State {
 
 #[derive(Debug)]
 struct Room {
-    users: Mutex<HashMap<u32, Arc<User>>>,
-    messages: Mutex<Vec<String>>,
+    users: Mutex<HashMap<u32, Arc<Mutex<User>>>>,
+    messages: Mutex<Vec<Message>>,
 }
 
 impl Room {
@@ -181,17 +241,24 @@ impl Room {
             messages: Mutex::new(Vec::new()),
         }
     }
-    async fn new_user(&self) -> (u32, Arc<User>) {
+    async fn new_user(&self) -> (u32, Arc<Mutex<User>>) {
         let mut users = self.users.lock().await;
         loop {
             let id = rand::random();
             if !users.contains_key(&id) {
-                let user = Arc::new(User::new());
+                let user = Arc::new(Mutex::new(User::new()));
                 users.insert(id, user.clone());
                 break (id, user);
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct Message {
+    content: String,
+    user_id: u32,
+    user_name: Option<String>,
 }
 
 #[derive(Debug, Eq, Hash, PartialEq)]

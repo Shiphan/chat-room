@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html>
     <head>
-        <title>Example</title>
+        <title>The Chat-Room</title>
     </head>
     <body>
         <p>Hi</p>
